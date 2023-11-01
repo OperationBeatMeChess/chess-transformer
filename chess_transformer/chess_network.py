@@ -1,5 +1,5 @@
-import random
-from adversarial_gym.chess_env import ChessEnv
+# import random
+# from adversarial_gym.chess_env import ChessEnv
 import torch
 from torch import nn
 import timm
@@ -7,6 +7,7 @@ import numpy as np
 
 from torch.cuda.amp import GradScaler
 
+from .ml_decoder import MLDecoder
 
 class ChessNetworkSimple(nn.Module):
     """
@@ -24,8 +25,9 @@ class ChessNetworkSimple(nn.Module):
     def __init__(self, hidden_dim: int, device = 'cpu', base_lr = 0.0009, max_lr = 0.009):
         super().__init__()
         
-        self.swin_transformer = timm.create_model('swin_base_patch4_window7_224', pretrained=False, 
-                                                  img_size=8, patch_size=1, window_size=2, in_chans=1).to(device)
+        self.swin_transformer = timm.create_model('swin_base_patch4_window7_224', pretrained=False,
+                                                  features_only=True, img_size=8, patch_size=1,
+                                                  window_size=2, in_chans=1).to(device)
         self.hidden_dim = hidden_dim
         self.action_dim = 4672
         self.device = device
@@ -58,15 +60,15 @@ class ChessNetworkSimple(nn.Module):
         if isinstance(x, np.ndarray):
             # Assuming its 8x8 array from chess env. Convert to (1,1,8,8) tensor
             x = torch.as_tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
-        features = self.swin_transformer.forward_features(x).requires_grad_(True)
+        features = self.swin_transformer(x).requires_grad_(True)
         action_logits = self.policy_head(features)
         board_val = self.value_head(features)
         return action_logits, board_val
 
-    def to_action(self, action_logits, legal_moves, top_n):
+    def to_action(self, action_logits, legal_actions, top_n):
         """ Randomly sample from top_n legal actions given output action logits """
 
-        legal_actions = [ChessEnv.move_to_action(move) for move in legal_moves]
+        # legal_actions = [ChessEnv.move_to_action(move) for move in legal_moves]
 
         if len(legal_actions) < top_n: top_n = len(legal_actions)
 
@@ -90,8 +92,45 @@ class ChessNetworkSimple(nn.Module):
 
         state = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device).requires_grad_(True)
         
-        features = self.swin_transformer.forward_features(state).requires_grad_(True)
+        features = self.swin_transformer(state).requires_grad_(True)
         features = features.view(features.shape[0], -1)
         
         policy_logits = self.policy_head(features)
         return self.to_action(policy_logits, legal_moves, top_n=sample_n)
+
+
+class ChessNetworkDecoder(nn.Module):
+    def __init__(self, device = 'cpu', base_lr = 0.0001, max_lr = 0.001):    
+        super().__init__()    
+        self.swin_transformer = timm.create_model('swin_base_patch4_window7_224', pretrained=False,
+                                                  img_size=8, patch_size=1,
+                                                  window_size=2, in_chans=1).to(device)
+        self.action_dim = 4672
+        self.device = device
+
+        self.grad_scaler = GradScaler()
+
+        # Policy head
+        self.policy_head = MLDecoder(num_classes=self.action_dim, initial_num_features=self.swin_transformer.head.in_features).to(device)
+        
+        # Value head
+        self.value_head = MLDecoder(num_classes=1, initial_num_features=self.swin_transformer.head.in_features).to(device)
+
+        self.value_loss = nn.MSELoss()
+        self.policy_loss = nn.CrossEntropyLoss()
+        self.tanh = nn.Tanh()
+
+        self.optimizer = torch.optim.SGD(self.parameters(), lr=base_lr)
+        self.scheduler = torch.optim.lr_scheduler.CyclicLR(self.optimizer, base_lr=base_lr, max_lr=max_lr)
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, base_lr=base_lr, max_lr=max_lr)
+
+    def forward(self, x):
+        if isinstance(x, np.ndarray):
+            # Assuming its 8x8 array from chess env. Convert to (1,1,8,8) tensor
+            x = torch.as_tensor(x, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(self.device)
+        
+        features = self.swin_transformer.forward_features(x).requires_grad_(True)
+        features = features.permute(0,3,1,2)
+        action_logits = self.policy_head(features)
+        board_val = self.tanh(self.value_head(features))
+        return action_logits, board_val
