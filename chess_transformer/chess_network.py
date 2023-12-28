@@ -2,7 +2,6 @@ import torch
 from torch import nn
 import timm
 import numpy as np
-
 from torch.cuda.amp import GradScaler
 
 
@@ -23,7 +22,7 @@ class ChessNetworkSimple(nn.Module):
         super().__init__()
         
         self.swin_transformer = timm.create_model('swin_base_patch4_window7_224', pretrained=False,
-                                                  features_only=True, img_size=8, patch_size=1,
+                                                  img_size=8, patch_size=1,
                                                   window_size=2, in_chans=1).to(device)
         self.hidden_dim = hidden_dim
         self.action_dim = 4672
@@ -34,14 +33,16 @@ class ChessNetworkSimple(nn.Module):
         # Policy head
         self.policy_head = nn.Sequential(
             nn.Linear(self.swin_transformer.head.in_features, hidden_dim),
-            nn.RReLU(),
+            # nn.RReLU(1/8,1/3),
+            nn.GELU(),
             nn.Linear(hidden_dim, self.action_dim),
         ).to(device)
         
         # Value head
         self.value_head = nn.Sequential(
             nn.Linear(self.swin_transformer.head.in_features, hidden_dim),
-            nn.RReLU(),
+            # nn.RReLU(1/8, 1/3),
+            nn.GELU(),
             nn.Linear(hidden_dim, 1),
             nn.Tanh()
         ).to(device)
@@ -51,13 +52,14 @@ class ChessNetworkSimple(nn.Module):
 
         self.optimizer = torch.optim.SGD(self.parameters(), lr=base_lr)
         # self.scheduler = torch.optim.lr_scheduler.CyclicLR(self.optimizer, base_lr=base_lr, max_lr=max_lr)
-        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, base_lr=base_lr, max_lr=max_lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=50_000)
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
             # Assuming its 8x8 array from chess env. Convert to (1,1,8,8) tensor
             x = torch.tensor(x, dtype=torch.float32, device=self.device, requires_grad=True).unsqueeze(0).unsqueeze(0)
-        features = self.swin_transformer(x)
+        
+        features = self.swin_transformer.forward_features(x)
         action_logits = self.policy_head(features)
         board_val = self.value_head(features)
         return action_logits, board_val
