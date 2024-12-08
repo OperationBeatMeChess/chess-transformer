@@ -14,26 +14,27 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, input_dim)
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
+        self.norm = nn.LayerNorm(input_dim)
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = self.linear1(self.norm1(x))
-        out = self.linear2(self.gelu(out))
+        out = self.norm(x)
+        out = self.linear1(out) # (B, N, C) -> (B, N, Hidden)
+        out = self.gelu(out)
         out = self.dropout(out)
-        out = self.norm2(out + x)
+        out = self.linear2(out) # (B, N, Hidden) -> (B, N, C)
+        out = out + x
         return out
 
 
 class StereoScaling(nn.Module):
     """ Learnable stereographic projection for each seq in attention map"""
-    def __init__(self, dim: int):
+    def __init__(self, seq_len: int):
         super().__init__()
         # Create the learnable x0 for stereographic projection
-        self.x0 = nn.Parameter(torch.empty(1, 1, dim, 1))
-        torch.nn.init.normal_(self.x0, std=0.02)
+        self.x0 = nn.Parameter(torch.empty(1, 1, seq_len, 1))
+        torch.nn.init.trunc_normal_(self.x0, std=0.02)
 
     def apply_stereo_scaling(self, x, x0, eps=1e-5):
         # Apply inverse stereographic projection to learnably scaled sphere
@@ -49,12 +50,11 @@ class StereoScaling(nn.Module):
 class AttentionBlock(nn.Module):
     """ Multi-head self-attention module with optional 1D or 2D relative position bias.
      
-    Using timm Swin Transformer implementation as a reference for the 2d relative position bias. The
-    2D relative position bias is used in the Channel-Mixing Attention block and the 1D relative position
-    bias is used in the Token-Mixing block. Bias is added to the attention scores
+    Using timm Swin Transformer implementation as a reference for the 2d relative position bias. And
+    uses a 1D relative position bias for the transposed attention in the mixer block.
 
-    Also uses a learnable stereographic projection as the scale in the attention calculation. In
-    Transformers without Tears paper (I think), they mention learnable normalization may have benefit of
+    Also has a learnable stereographic projection as the scale in the attention calculation. In
+    Transformers without Tears paper (I think), they mention learnable normalization may help by
     smoothing the loss landscape.
     """
     def __init__(
@@ -64,24 +64,26 @@ class AttentionBlock(nn.Module):
             num_heads, 
             dropout=0.0, 
             use_2d_relative_position=True,
+            expansion_ratio=1.0
     ):
         super().__init__()
         self.num_heads = num_heads
         self.dim = embed_dim
         self.seq_len = seq_len
         self.use_2d_relative_position = use_2d_relative_position
-        self.head_dim = embed_dim // num_heads
-        assert self.head_dim * num_heads == self.dim, "embed_dim must be divisible by num_heads"
-    
+        self.expanded_dim = int(embed_dim * expansion_ratio)
+        self.head_dim = self.expanded_dim // num_heads
+        assert self.head_dim * num_heads == self.expanded_dim, "expanded_dim must be divisible by num_heads"
+        
         self.scale = StereoScaling(self.seq_len)
     
         # Splitting qkv into separate projections
-        self.q_proj = nn.Linear(embed_dim, embed_dim)  # Producing queries
-        self.k_proj = nn.Linear(embed_dim, embed_dim)  # Producing keys
-        self.v_proj = nn.Linear(embed_dim, embed_dim)  # Producing values
+        self.q_proj = nn.Linear(embed_dim, self.expanded_dim) 
+        self.k_proj = nn.Linear(embed_dim, self.expanded_dim)
+        self.v_proj = nn.Linear(embed_dim, self.expanded_dim)  
         
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj = nn.Linear(self.expanded_dim, embed_dim)
     
         if self.use_2d_relative_position:
             self.h, self.w = self.compute_grid_dimensions(seq_len)
@@ -90,7 +92,7 @@ class AttentionBlock(nn.Module):
             )
             self.register_buffer("relative_position_index", self.get_2d_relative_position_index(self.h, self.w))
             nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
-        else: # 1D relative position bias
+        else:
             self.relative_position_bias_table = nn.Parameter(
                 torch.zeros(2 * seq_len - 1, num_heads)
             )
@@ -140,38 +142,54 @@ class AttentionBlock(nn.Module):
     def forward(self, x):
         B, N, C = x.shape
         assert N == self.seq_len, f"Input sequence length {N} does not match expected {self.seq_len}"
-        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # B, H, N, C
+
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
         attn = torch.matmul(q, k.transpose(-2, -1))  # B, H, N, N
         
         relative_position_bias = self._get_rel_pos_bias() # 1, H, N, N
-        attn = attn + relative_position_bias  # Broadcasting over batch size
+        attn = attn + relative_position_bias
 
         # attn *= self.scale
         attn = self.scale(attn)
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        x = torch.matmul(attn, v)  # (B, H, N, C)
-        x = x.transpose(1, 2).reshape(B, N, C)  # (B, N, C)
-        x = self.proj(x)
+        x = torch.matmul(attn, v)
+        x = x.transpose(1, 2).reshape(B, N, self.expanded_dim) 
+        x = self.proj(x) 
         x = self.dropout(x)
 
         return x
+
 
 class MixerBlock(nn.Module):
     def __init__(self, piece_embed_dim, num_heads=16, dropout=0., drop_path=0.):
         super().__init__()
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.channel_mixing_norm = nn.LayerNorm(piece_embed_dim)
-        self.channel_mixing_attn = AttentionBlock(64,piece_embed_dim, num_heads, dropout=dropout, use_2d_relative_position=True)
+        self.channel_mixing_attn = AttentionBlock(
+            64,
+            piece_embed_dim, 
+            num_heads, 
+            dropout=dropout, 
+            use_2d_relative_position=True,
+            expansion_ratio=1.0,
+        )
         self.token_mixing_norm = nn.LayerNorm(piece_embed_dim)
-        self.token_mixing_attn = AttentionBlock(piece_embed_dim, 64, 16, dropout=dropout, use_2d_relative_position=False)
+        self.token_mixing_attn = AttentionBlock(
+            piece_embed_dim, 
+            64, 
+            16, 
+            dropout=dropout, 
+            use_2d_relative_position=False,
+            expansion_ratio=1.0,
+        )
 
         total_features = 64 * piece_embed_dim
-        self.out_mlp = ResidualBlock(total_features, 2*total_features, dropout=dropout)
+        self.out_mlp = ResidualBlock(total_features, int(1*total_features), dropout=dropout)
 
     def forward(self, x):
         # x shape: (B, 64, piece_embed)
@@ -208,7 +226,7 @@ class ChessTransformer(nn.Module):
         self.embed_mlp = ResidualBlock(num_features, 2 * num_features, dropout=dropout)
 
         # Mixer blocks
-        # currently only params for num_heads, drop_path
+        # params: [num_heads, drop_path] (dropout uses lots of memory)
         params_config = [(6, 0.05)] * 4 + [(8, 0.1)] * 4 + [(12, 0.15)] * 8 + [(24, 0.2)] * 4
         assert len(params_config) == num_mixer_layers, "Length of config does not match num_mixer_layers"
         
@@ -221,7 +239,8 @@ class ChessTransformer(nn.Module):
 
         # Policy head
         self.policy_head = nn.Sequential(
-            ResidualBlock(num_features, 2*num_features),
+            ResidualBlock(num_features, int(1*num_features)),
+            nn.LayerNorm(num_features),
             nn.Linear(num_features, num_features),
             nn.GELU(),
             nn.Linear(num_features, self.action_dim),
@@ -229,7 +248,8 @@ class ChessTransformer(nn.Module):
         
         # Value head
         self.value_head = nn.Sequential(
-            ResidualBlock(num_features, 2*num_features),
+            ResidualBlock(num_features, int(1*num_features)),
+            nn.LayerNorm(num_features),
             nn.Linear(num_features, num_features),
             nn.GELU(),
             nn.Linear(num_features, 1),
@@ -237,9 +257,10 @@ class ChessTransformer(nn.Module):
         ).to(device)
 
         # Critic head
-        critic_features = 64 * (piece_embed_dim + action_embed_dim//64)
+        critic_features = 64 * piece_embed_dim + action_embed_dim
         self.critic_head = nn.Sequential(
-            ResidualBlock(critic_features, 2*critic_features),
+            ResidualBlock(critic_features, int(1*critic_features)),
+            nn.LayerNorm(critic_features),
             nn.Linear(critic_features, num_features),
             nn.GELU(),
             nn.Linear(num_features, 1),
@@ -326,6 +347,8 @@ class ChessTransformer(nn.Module):
 # # # # Test the critic head
 # action = torch.randint(0, 4672, (32, 1))
 # critic_val = transformer.forward_critic(features, action.cuda())
+
+
 
 # # test relative position attention
 # rel_pos = AttentionBlock(64,24, 8)
